@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+Jellycat Diner (FAO Schwarz) FareHarbor availability monitor.
+
+Watches the public FareHarbor booking calendar for the Jellycat Diner
+Experience in NYC (company shortname "faoschwarz", item id 592655) and
+texts you the moment any date in your target range shows open time slots.
+
+HOW IT WORKS
+------------
+This is NOT using FareHarbor's private partner API (that needs credentials
+we don't have). Instead it drives a real (headless) browser to the exact
+same public booking widget a human visitor sees, and reads the calendar
+off the rendered page. That means it's a bit more fragile to page
+redesigns than a clean API, which is why DEBUG MODE exists below -- use it
+once to confirm the selectors still match before trusting the loop.
+
+TEXT ALERTS
+-----------
+Sent via Verizon's email-to-SMS gateway (6109956647@vtext.com), which
+means the "sending" side is just a Gmail account emailing that address.
+Requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD environment variables to be
+set (an App Password, not your normal Gmail password -- see setup notes).
+
+SETUP
+-----
+    pip install playwright
+    playwright install chromium
+
+USAGE
+-----
+    # 1. First, sanity check the scraper can see the calendar at all:
+    python3 jellycat_monitor.py --debug
+
+    #    This dumps the rendered HTML + any JSON network responses to
+    #    ./debug_output/ so we can fix selectors together if something's off.
+
+    # 2. Once debug output looks right, run the real monitor:
+    export GMAIL_ADDRESS="youraccount@gmail.com"
+    export GMAIL_APP_PASSWORD="xxxxxxxxxxxxxxxx"
+    python3 jellycat_monitor.py
+
+CONFIG
+------
+Edit the constants below or pass CLI flags (--help for all options).
+
+RUNNING VIA GITHUB ACTIONS
+---------------------------
+For scheduled runs (no laptop needed), call this with --once so each
+workflow run does a single check and exits; let GitHub Actions' cron
+trigger repeated runs instead of this script's own sleep loop. See the
+accompanying .github/workflows/monitor.yml.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import random
+import smtplib
+import sys
+import time
+from email.mime.text import MIMEText
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+COMPANY_SHORTNAME = "faoschwarz"
+ITEM_ID = "592655"  # Jellycat Diner Experience
+TARGET_DATES = ["2026-08-05", "2026-08-06", "2026-08-07", "2026-08-08", "2026-08-09"]
+
+SMS_GATEWAY_ADDRESS = "6109956647@vtext.com"  # Verizon email-to-SMS gateway
+
+DEFAULT_POLL_SECONDS = 90       # base interval between checks
+JITTER_SECONDS = 25             # random +/- added so requests aren't robotic
+DEBUG_DIR = Path("debug_output")
+
+BASE_URL = "https://fareharbor.com/embeds/book/{company}/items/{item}/calendar/{year}/{month:02d}/?full-items=yes"
+
+
+def calendar_url(year: int, month: int) -> str:
+    return BASE_URL.format(company=COMPANY_SHORTNAME, item=ITEM_ID, year=year, month=month)
+
+
+# ---------------------------------------------------------------------------
+# Notification (SMS via Verizon email-to-SMS gateway)
+# ---------------------------------------------------------------------------
+
+def send_sms(body: str):
+    """
+    Sends a text by emailing Verizon's SMS gateway through Gmail's SMTP
+    server, using an App Password (NOT your normal Gmail password --
+    Google blocks plain-password SMTP login). Reads credentials from
+    environment variables so nothing sensitive lives in this file:
+        GMAIL_ADDRESS       the Gmail account sending the alert
+        GMAIL_APP_PASSWORD  a 16-character App Password for that account
+
+    Carrier gateways reject/truncate long messages, so keep `body` short.
+    """
+    gmail_address = os.environ.get("GMAIL_ADDRESS")
+    gmail_app_password = os.environ.get("GMAIL_APP_PASSWORD")
+    if not gmail_address or not gmail_app_password:
+        print("(SMS not sent: GMAIL_ADDRESS / GMAIL_APP_PASSWORD env vars not set)")
+        return
+
+    short_body = body if len(body) <= 140 else body[:137] + "..."
+    msg = MIMEText(short_body)
+    msg["Subject"] = ""  # carrier gateways generally ignore/mangle subject lines
+    msg["From"] = gmail_address
+    msg["To"] = SMS_GATEWAY_ADDRESS
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(gmail_address, gmail_app_password)
+            server.sendmail(gmail_address, [SMS_GATEWAY_ADDRESS], msg.as_string())
+        print(f"(SMS sent to {SMS_GATEWAY_ADDRESS})")
+    except Exception as e:
+        print(f"(SMS send failed: {e})")
+
+
+def notify(message: str):
+    print(f"\n*** ALERT: {message} ***\n")
+    sys.stdout.write("\a")  # terminal bell, helps if running in a visible window
+    sys.stdout.flush()
+    send_sms(message)
+
+
+# ---------------------------------------------------------------------------
+# Human-like behavior
+# ---------------------------------------------------------------------------
+
+def human_like_interaction(page):
+    """
+    Nudges the mouse and scrolls the page a bit, the way a real visitor
+    would while looking at a calendar. Doesn't guarantee anything about
+    bot-detection, but it's cheap insurance and makes --debug runs look
+    like normal browsing if you're watching the window.
+    """
+    try:
+        viewport = page.viewport_size or {"width": 1280, "height": 800}
+        w, h = viewport["width"], viewport["height"]
+
+        # A few slow, slightly irregular mouse movements rather than one
+        # straight jump (real cursors don't teleport).
+        steps = random.randint(3, 6)
+        for _ in range(steps):
+            x = random.randint(int(w * 0.15), int(w * 0.85))
+            y = random.randint(int(h * 0.15), int(h * 0.85))
+            page.mouse.move(x, y, steps=random.randint(5, 15))
+            page.wait_for_timeout(random.randint(80, 250))
+
+        # Small scroll down then partway back up, like someone skimming
+        # the calendar grid.
+        page.mouse.wheel(0, random.randint(150, 400))
+        page.wait_for_timeout(random.randint(200, 500))
+        page.mouse.wheel(0, -random.randint(50, 150))
+        page.wait_for_timeout(random.randint(150, 400))
+    except Exception:
+        pass  # never let cosmetic behavior break the actual check
+
+
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
+def check_month(page, year: int, month: int, debug: bool) -> dict:
+    """
+    Loads the calendar for a given year/month and returns
+    {date_str: available_bool} for any date cells we can identify.
+    Also captures raw JSON network responses in debug mode so we can
+    tighten this up if FareHarbor's markup differs from what we assume.
+    """
+    captured_json = []
+
+    def on_response(response):
+        try:
+            ctype = response.headers.get("content-type", "")
+            if "json" in ctype and ("availabil" in response.url or "calendar" in response.url):
+                captured_json.append({"url": response.url, "body": response.json()})
+        except Exception:
+            pass
+
+    if debug:
+        page.on("response", on_response)
+
+    url = calendar_url(year, month)
+    page.goto(url, wait_until="networkidle", timeout=30000)
+    page.wait_for_timeout(1500)  # let client-side JS finish rendering the grid
+    human_like_interaction(page)
+
+    if debug:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        (DEBUG_DIR / f"page_{year}_{month:02d}.html").write_text(page.content())
+        (DEBUG_DIR / f"network_{year}_{month:02d}.json").write_text(
+            json.dumps(captured_json, indent=2, default=str)
+        )
+        print(f"[debug] saved page HTML + {len(captured_json)} JSON responses to {DEBUG_DIR}/")
+
+    results = {}
+
+    # FareHarbor's calendar renders day cells as elements exposing the date
+    # via a data attribute or aria-label, and marks unbookable days with an
+    # "unavailable" (or similarly named) class. We check a few plausible
+    # selector patterns defensively rather than betting on just one.
+    day_cells = page.query_selector_all("[data-date], [aria-label*='202']")
+    for cell in day_cells:
+        date_attr = cell.get_attribute("data-date") or cell.get_attribute("aria-label") or ""
+        matched_date = next((d for d in TARGET_DATES if d in date_attr or d.replace("-", "") in date_attr), None)
+        if not matched_date:
+            continue
+        class_attr = (cell.get_attribute("class") or "").lower()
+        disabled = cell.get_attribute("aria-disabled") == "true" or cell.is_disabled() if hasattr(cell, "is_disabled") else False
+        looks_unavailable = any(k in class_attr for k in ["unavailable", "disabled", "sold-out", "soldout", "inactive"])
+        results[matched_date] = not (disabled or looks_unavailable)
+
+    return results
+
+
+def run_monitor(poll_seconds: int, debug: bool, once: bool):
+    already_alerted = set()
+    months_to_check = sorted({(int(d[:4]), int(d[5:7])) for d in TARGET_DATES})
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not debug)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+
+        try:
+            while True:
+                found_any = {}
+                for year, month in months_to_check:
+                    try:
+                        found_any.update(check_month(page, year, month, debug))
+                    except Exception as e:
+                        print(f"[{dt.datetime.now():%H:%M:%S}] error checking {year}-{month:02d}: {e}")
+
+                timestamp = dt.datetime.now().strftime("%H:%M:%S")
+                if found_any:
+                    status = ", ".join(f"{d}={'OPEN' if v else 'closed'}" for d, v in sorted(found_any.items()))
+                    print(f"[{timestamp}] {status}")
+                else:
+                    print(f"[{timestamp}] no matching date cells found on page "
+                          f"(run with --debug to inspect why)")
+
+                for date_str, is_open in found_any.items():
+                    if is_open and date_str not in already_alerted:
+                        notify(f"Jellycat Diner has an open slot on {date_str}! Book now: "
+                               f"https://faoschwarz.com/pages/reservations")
+                        already_alerted.add(date_str)
+
+                if debug or once:
+                    break
+
+                sleep_for = poll_seconds + random.randint(-JITTER_SECONDS, JITTER_SECONDS)
+                time.sleep(max(20, sleep_for))
+        finally:
+            browser.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--debug", action="store_true",
+                         help="Run once, visibly (non-headless), and dump page HTML + network JSON to ./debug_output/")
+    parser.add_argument("--once", action="store_true", help="Check once and exit (no polling loop)")
+    parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS,
+                         help=f"Base seconds between checks (default {DEFAULT_POLL_SECONDS})")
+    args = parser.parse_args()
+
+    print(f"Monitoring {COMPANY_SHORTNAME} item {ITEM_ID} for: {', '.join(TARGET_DATES)}")
+    print(f"Text alerts will go to {SMS_GATEWAY_ADDRESS}")
+    run_monitor(poll_seconds=args.poll_seconds, debug=args.debug, once=args.once)
+
+
+if __name__ == "__main__":
+    main()
